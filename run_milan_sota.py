@@ -301,7 +301,7 @@ def main():
     elif pretrain_epochs > 0:
         print(f"\n🧠 [Stage 1] Self-Supervised Pre-training for {pretrain_epochs} Epochs...")
         
-        optimizer_pt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer_ft = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         scheduler_pt = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_pt, T_0=10, T_mult=1, eta_min=lr*0.01)
         
         for epoch in range(pretrain_epochs):
@@ -344,17 +344,13 @@ def main():
     # 🔥 Phase 2: Supervised Fine-tuning (有监督微调)
     # ==========================================
     print(f"\n🎯 [Stage 2] Supervised Fine-tuning (Linear Probing) for {num_epochs} Epochs...")
-    
-    # 锁死底座，只放开顶层分类器
-    for name, param in model.named_parameters():
-        if "classifier" not in name:
-            param.requires_grad = False
             
     optimizer_ft = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
     scheduler_ft = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_ft, T_0=h.get("COSINE_T0", 10), T_mult=1, eta_min=lr*0.01)
     criterion = nn.CrossEntropyLoss(weight=weights_cpu.to(device))
 
     best_val_auprc = -1.0
+    best_val_f1 = -1.0
     patience_cnt = 0
     training_log = []
 
@@ -405,13 +401,28 @@ def main():
         print(log_line)
         training_log.append(log_line)
         
-        if val_auprc_macro > best_val_auprc + h.get("MIN_DELTA", 0.0):
+        # 🌟 动态耐心值机制：如果 AUPRC 已经接近完美（>0.999），大幅缩短耐心防止过拟合
+        current_patience = patience
+        if val_auprc_macro >= 0.9990:
+            current_patience = 5  # 学霸通道：满分后最多只多看 5 轮，不涨直接交卷
+
+        is_auprc_improved = val_auprc_macro > best_val_auprc + 1e-4
+        is_auprc_equal = abs(val_auprc_macro - best_val_auprc) <= 1e-4
+        is_f1_improved = val_f1_macro > best_val_f1
+
+        if is_auprc_improved or (is_auprc_equal and is_f1_improved):
             best_val_auprc = val_auprc_macro
+            best_val_f1 = val_f1_macro
             patience_cnt = 0
             torch.save(model.state_dict(), os.path.join(save_dir, "best_model.pth"))
+            # 增加一行提示，让你清楚知道是哪个指标触发了保存
+            trigger_reason = "AUPRC Improved" if is_auprc_improved else "AUPRC Equal, F1 Improved"
+            print(f"  💾 [Model Saved] {trigger_reason} (AUPRC: {best_val_auprc:.4f}, F1: {best_val_f1:.4f})")
         else:
             patience_cnt += 1
-            if patience_cnt >= patience: break
+            if patience_cnt >= current_patience: 
+                print(f"  🛑 Early stopping triggered at Epoch {epoch+1} (No improvement for {current_patience} epochs).")
+                break
 
     # ====================
     # 测试与动态阈值应用
