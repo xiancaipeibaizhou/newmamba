@@ -94,10 +94,10 @@ class EntropyGatingUnit(nn.Module):
 
     def __init__(self, hidden_dim):
         super().__init__()
-        # ✨ [Swish 优化] 使用 SiLU (Swish) 替换 ReLU，保留异常特征的负梯度
+        # 输入维度增加 1，用于接收显式的图结构熵标量
         self.gate_fc = nn.Sequential(
             nn.Linear(hidden_dim * 2 + 1, hidden_dim // 2),
-            nn.SiLU(), 
+            nn.ReLU(),
             nn.Linear(hidden_dim // 2, 1),
             nn.Sigmoid()
         )
@@ -288,7 +288,7 @@ class LinearTemporalAttention(nn.Module):
 
 
 # ==========================================
-# 5.5 新增核心组件: Mamba Temporal Stream (改进版 MambaShield)
+# 5.5 新增核心组件: Mamba Temporal Stream
 # ==========================================
 class MambaTemporalStream(nn.Module):
     def __init__(self, d_model, depth=2):
@@ -304,23 +304,8 @@ class MambaTemporalStream(nn.Module):
         self.norms = nn.ModuleList([
             nn.LayerNorm(d_model) for _ in range(depth)
         ])
-        
-        # ✨ [MambaShield 改进] 状态抗毒网关 (Poison-Resilient Filter)
-        # 负责根据环境熵来软屏蔽高风险的投毒特征
-        self.poison_filter = nn.Sequential(
-            nn.Linear(1, d_model // 2),
-            nn.SiLU(),
-            nn.Linear(d_model // 2, d_model),
-            nn.Sigmoid()
-        )
 
-    def forward(self, x, graph_entropy=None):
-        # ✨ [MambaShield 改进] 利用结构熵对输入进行动态软过滤
-        if graph_entropy is not None:
-            # 根据宏观熵值为每个节点生成特征级的保护屏障
-            modulator = self.poison_filter(graph_entropy).unsqueeze(1) # [Batch, 1, d_model]
-            x = x * modulator 
-            
+    def forward(self, x):
         for blk, norm in zip(self.blocks, self.norms):
             x = x + blk(norm(x))
         return x
@@ -511,13 +496,11 @@ class MILAN(nn.Module):
 
         x_local_in = x_base.permute(0, 2, 1)
         x_local = self.stream_local(x_local_in).permute(0, 2, 1)
-        
-        # ✨ [MR-DID 修改] 提供拓扑宏观先验给融合门控与 Mamba 过滤器
+        x_global = self.stream_global(x_base)
+
+        # ✨ [MR-DID 修改] 提供拓扑宏观先验给融合门控
         graph_entropies = torch.stack(batch_graph_entropies)
         mean_graph_entropy = graph_entropies.mean().unsqueeze(0).expand(num_unique, 1)
-
-        # ✨ [MambaShield 改进] 将拓扑熵传入 Mamba 触发选择性投毒防御
-        x_global = self.stream_global(x_base, mean_graph_entropy)
 
         dense_out, alpha_scores = self.gating(x_local, x_global, x_base, mean_graph_entropy)
 
@@ -557,13 +540,7 @@ class MILAN(nn.Module):
 
                     logits = torch.matmul(z1, z2.T) / 0.1
                     labels = torch.arange(z1.size(0), device=device)
-                    base_cl_loss = F.cross_entropy(logits, labels)
-                    
-                    # ✨ [Entropy-Regulated CL 改进] 熵正则化对比生成
-                    # 熵越大（混乱/异常），tanh(g_entropy) 越大，从而强迫模型更依赖无监督表征
-                    current_frame_entropy = batch_graph_entropies[t]
-                    dynamic_cl_scale = 1.0 + torch.tanh(current_frame_entropy)
-                    cl_loss = base_cl_loss * dynamic_cl_scale
+                    cl_loss = F.cross_entropy(logits, labels)
                 else:
                     cl_loss = torch.tensor(0.0, device=device)
 

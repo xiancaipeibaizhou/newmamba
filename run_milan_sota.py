@@ -301,7 +301,7 @@ def main():
     elif pretrain_epochs > 0:
         print(f"\n🧠 [Stage 1] Self-Supervised Pre-training for {pretrain_epochs} Epochs...")
         
-        optimizer_ft = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer_pt = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
         scheduler_pt = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_pt, T_0=10, T_mult=1, eta_min=lr*0.01)
         
         for epoch in range(pretrain_epochs):
@@ -343,11 +343,15 @@ def main():
     # ==========================================
     # 🔥 Phase 2: Supervised Fine-tuning (有监督微调)
     # ==========================================
-    print(f"\n🎯 [Stage 2] Supervised Fine-tuning (Linear Probing) for {num_epochs} Epochs...")
+    print(f"\n🎯 [Stage 2] Joint Supervised Fine-tuning for {num_epochs} Epochs...")
             
     optimizer_ft = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=weight_decay)
     scheduler_ft = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer_ft, T_0=h.get("COSINE_T0", 10), T_mult=1, eta_min=lr*0.01)
     criterion = nn.CrossEntropyLoss(weight=weights_cpu.to(device))
+
+    # 获取对比学习权重
+    cl_weight = float(h.get("CL_LOSS_WEIGHT", 0.5))
+    print(f"⚖️ Loss Formulation: Total Loss = CE Loss + {cl_weight} * CL Loss")
 
     best_val_auprc = -1.0
     best_val_f1 = -1.0
@@ -357,13 +361,18 @@ def main():
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0.0
+        total_ce = 0.0
+        total_cl = 0.0
+        cl_active_steps = 0
+        
         optimizer_ft.zero_grad(set_to_none=True)
         
         for step, batched_seq in enumerate(tqdm(train_loader, desc=f"FT Epoch {epoch+1}", leave=False)):
             batched_seq = [g.to(device) for g in batched_seq]
             
             out = model(batched_seq)
-            all_preds, _ = out if isinstance(out, tuple) else (out, None)
+            # 拿到预测结果和对比学习 loss
+            all_preds, cl_loss = out if isinstance(out, tuple) else (out, None)
             
             edge_masks = getattr(model, "_last_edge_masks", None)
             if edge_masks is not None and len(edge_masks) > 0 and edge_masks[-1] is not None:
@@ -371,11 +380,21 @@ def main():
             else:
                 last_frame_labels = batched_seq[-1].edge_labels
                 
-            main_loss = criterion(all_preds[-1], last_frame_labels)
-            loss = main_loss / float(accum_steps)
+            # 计算主分类 Loss
+            ce_loss = criterion(all_preds[-1], last_frame_labels)
             
+            # 联合计算 Total Loss
+            batch_total_loss = ce_loss
+            if torch.is_tensor(cl_loss) and cl_loss.requires_grad:
+                batch_total_loss = batch_total_loss + cl_weight * cl_loss
+                total_cl += cl_loss.item()
+                cl_active_steps += 1
+                
+            loss = batch_total_loss / float(accum_steps)
             loss.backward()
-            total_loss += main_loss.item()
+            
+            total_loss += batch_total_loss.item()
+            total_ce += ce_loss.item()
                 
             if ((step + 1) % accum_steps == 0) or ((step + 1) == len(train_loader)):
                 torch.nn.utils.clip_grad_norm_(model.classifier.parameters(), max_norm=2.0)
@@ -384,7 +403,7 @@ def main():
 
         scheduler_ft.step()
         
-        # ================= SOTA 验证评估 (Macro-AUPRC 早停) =================
+        # ================= SOTA 验证评估 =================
         val_true, val_probs = get_eval_predictions(model, val_loader, device)
         classes = np.arange(num_classes)
         val_true_bin = label_binarize(val_true, classes=classes)
@@ -393,12 +412,15 @@ def main():
             val_true_bin = np.hstack((1 - val_true_bin, val_true_bin))
             
         val_auprc_macro = average_precision_score(val_true_bin, val_probs, average='macro')
-        
         val_preds_raw = np.argmax(val_probs, axis=-1)
         val_f1_macro = f1_score(val_true, val_preds_raw, average='macro', zero_division=0)
         
-        log_line = f"FT Epoch {epoch+1:03d} | Supervised Loss: {total_loss/max(1, len(train_loader)):.4f} | Val AUPRC: {val_auprc_macro:.4f} | Val F1: {val_f1_macro:.4f}"
-        print(log_line)
+        # 修改这里以适配你 plot_training_logs.py 里的正则提取
+        avg_ce = total_ce / max(1, len(train_loader))
+        avg_cl = total_cl / max(1, cl_active_steps) if cl_active_steps > 0 else 0.0
+        
+        log_line = f"Epoch {epoch+1:03d} | Loss: {avg_ce:.4f} | CL: {avg_cl:.4f} | Val AUPRC: {val_auprc_macro:.4f} | Val F1: {val_f1_macro:.4f}"
+        print(f"FT {log_line}")
         training_log.append(log_line)
         
         # 🌟 动态耐心值机制：如果 AUPRC 已经接近完美（>0.999），大幅缩短耐心防止过拟合

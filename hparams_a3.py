@@ -68,7 +68,7 @@ DATASET_BEST = {
     # NB15: 切分窗口为 60s
     # 物理机制: 复杂多步攻击与混合型渗透。短时序 (seq=3) 配合高性价比短程核 [1, 3] 捕捉渗透链；
     # 极强的图扰动 (0.4) 撕碎海量背景噪声，大幅提升了对隐蔽 APT 攻击的拦截率 (ASA)。
-    "nb15":        {"SEQ_LEN": 3,  "HIDDEN": 128, "HEADS": 8, "DROPEDGE_P": 0.4, "CL_LOSS_WEIGHT": 0.5, "LR": 0.001,  "MAX_CL_EDGES": 8192, "PATIENCE": 25, "KERNELS": [1, 3]},
+    "nb15":        {"SEQ_LEN": 20,  "HIDDEN": 128, "HEADS": 8, "DROPEDGE_P": 0.4, "CL_LOSS_WEIGHT": 0.5, "LR": 0.001,  "MAX_CL_EDGES": 8192, "PATIENCE": 25, "KERNELS": [1, 3]},
     
     # IDS2017: 切分窗口为 20s
     # 物理机制: 毫秒级瞬间爆发的高频风暴 (DDoS/BruteForce)。星型爆破拓扑极其脆弱，坚决不丢边 (Drop=0.0)；
@@ -107,6 +107,7 @@ def resolve_hparams(group, env=None, dataset=None):
         "WARMUP_EPOCHS": int(env.get("WARMUP_EPOCHS", "5")),
         "COSINE_T0": int(env.get("COSINE_T0", "15")), 
         "COSINE_TMULT": int(env.get("COSINE_TMULT", "1")),
+        "PRETRAIN_EPOCHS": int(env.get("PRETRAIN_EPOCHS", "10")),
     }
 
     # 1. 注入 Dataset 最优 Base 设定
